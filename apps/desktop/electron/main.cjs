@@ -1319,12 +1319,12 @@ function unwrapWindowsVenvHermesCommand(command, dashboardArgs) {
   if (path.basename(scriptsDir).toLowerCase() !== 'scripts') return null
 
   const venvRoot = path.dirname(scriptsDir)
-  const python = getNoConsoleVenvPython(venvRoot)
+  const python = getVenvPython(venvRoot)
   if (!fileExists(python)) return null
 
   const root = path.dirname(venvRoot)
   return {
-    label: `existing Hermes no-console Python at ${python}`,
+    label: `existing Hermes Python at ${python}`,
     command: python,
     args: ['-m', 'hermes_cli.main', ...dashboardArgs],
     bootstrap: false,
@@ -1334,7 +1334,6 @@ function unwrapWindowsVenvHermesCommand(command, dashboardArgs) {
       venvRoot
     }),
     kind: 'python',
-    readyFile: true,
     shell: false
   }
 }
@@ -1559,62 +1558,18 @@ function getVenvPython(venvRoot) {
   return path.join(venvRoot, IS_WINDOWS ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'))
 }
 
-function readVenvHome(venvRoot) {
-  try {
-    const cfg = fs.readFileSync(path.join(venvRoot, 'pyvenv.cfg'), 'utf8')
-    const match = cfg.match(/^home\s*=\s*(.+?)\s*$/im)
-    return match ? match[1].trim() : null
-  } catch {
-    return null
-  }
-}
-
-function getNoConsoleVenvPython(venvRoot) {
-  if (!IS_WINDOWS) return getVenvPython(venvRoot)
-
-  // The venv's ``Scripts\pythonw.exe`` is a uv launcher shim that re-execs the
-  // base console ``python.exe``, allocating a conhost/Windows Terminal window
-  // that CREATE_NO_WINDOW can't suppress. Use the base ``pythonw.exe`` directly;
-  // callers put the venv site-packages on PYTHONPATH so imports still resolve.
-  const baseHome = readVenvHome(venvRoot)
-  if (baseHome) {
-    const basePythonw = path.join(baseHome, 'pythonw.exe')
-    if (fileExists(basePythonw)) return basePythonw
-  }
-
-  return path.join(venvRoot, 'Scripts', 'pythonw.exe')
-}
-
-function toNoConsolePython(pythonPath) {
-  if (!IS_WINDOWS || !pythonPath) return pythonPath
-
-  const resolved = String(pythonPath)
-  if (/pythonw\.exe$/i.test(resolved)) return resolved
-
-  if (/python\.exe$/i.test(resolved)) {
-    const pythonw = path.join(path.dirname(resolved), 'pythonw.exe')
-    if (fileExists(pythonw)) return pythonw
-  }
-
-  return pythonPath
-}
-
-function applyWindowsNoConsoleSpawnHints(backend) {
-  if (!IS_WINDOWS || !backend?.command) return backend
-
-  const usesHermesModule =
-    backend.kind === 'python' ||
-    (Array.isArray(backend.args) && backend.args[0] === '-m' && backend.args[1] === 'hermes_cli.main')
-
-  if (!usesHermesModule) return backend
-
-  backend.command = toNoConsolePython(backend.command)
-  if (/pythonw\.exe$/i.test(path.basename(String(backend.command || '')))) {
-    backend.readyFile = true
-  }
-
-  return backend
-}
+// Windows console-window flashes are governed by the *parent's* console, not by
+// each child spawn. A GUI-subsystem parent (pythonw.exe) has no console, so every
+// console-subsystem child it spawns (git, gh, cmd, ...) must allocate its own —
+// which flashes a window. A console-subsystem parent (python.exe) launched with
+// CREATE_NO_WINDOW instead owns a single *windowless* console that all of its
+// children inherit, so none of them flash. We therefore launch the backend as the
+// venv's console python.exe and rely on hiddenWindowsChildOptions() (windowsHide:
+// true -> CREATE_NO_WINDOW) to keep that one console windowless. This makes "no
+// flashing windows" a property of the one backend launch rather than a flag that
+// has to be remembered at every descendant spawn site. Restoring console python
+// also restores stdout, so the backend announces its port on the normal
+// HERMES_DASHBOARD_READY stdout line and no ready-file side channel is needed.
 
 function getVenvSitePackagesEntries(venvRoot) {
   const entries = []
@@ -2836,9 +2791,9 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
 
   const venvRoot = path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
-  const command = IS_WINDOWS && fileExists(venvPython) ? getNoConsoleVenvPython(venvRoot) : toNoConsolePython(python)
+  const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
 
-  return applyWindowsNoConsoleSpawnHints({
+  return {
     kind: 'python',
     label,
     command,
@@ -2851,7 +2806,7 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
     root,
     bootstrap: Boolean(options.bootstrap),
     shell: false
-  })
+  }
 }
 
 // createActiveBackend — build a backend pointing at ACTIVE_HERMES_ROOT, the
@@ -2860,9 +2815,9 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
 // ensureRuntime() to create / refresh it before launch.
 function createActiveBackend(dashboardArgs) {
   const venvPython = getVenvPython(VENV_ROOT)
-  const command = fileExists(venvPython) ? getNoConsoleVenvPython(VENV_ROOT) : toNoConsolePython(findSystemPython())
+  const command = fileExists(venvPython) ? venvPython : findSystemPython()
 
-  return applyWindowsNoConsoleSpawnHints({
+  return {
     kind: 'python',
     label: `Hermes at ${ACTIVE_HERMES_ROOT}`,
     command,
@@ -2875,7 +2830,7 @@ function createActiveBackend(dashboardArgs) {
     root: ACTIVE_HERMES_ROOT,
     bootstrap: true,
     shell: false
-  })
+  }
 }
 
 function resolveHermesBackend(dashboardArgs) {
@@ -2982,15 +2937,15 @@ function resolveHermesBackend(dashboardArgs) {
     // failure, fall through to step 6 so the bootstrap runner pulls
     // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
     if (canImportHermesCli(python)) {
-      return applyWindowsNoConsoleSpawnHints({
+      return {
         kind: 'python',
         label: `installed hermes_cli module via ${python}`,
-        command: toNoConsolePython(python),
+        command: python,
         args: ['-m', 'hermes_cli.main', ...dashboardArgs],
         bootstrap: false,
         env: {},
         shell: false
-      })
+      }
     }
     rememberLog(`Ignoring system Python ${python}: hermes_cli is not importable; falling through to bootstrap.`)
   }
@@ -3024,7 +2979,7 @@ function resolveHermesBackend(dashboardArgs) {
 async function ensureRuntime(backend) {
   if (!backend.bootstrap) {
     await advanceBootProgress('runtime.external', `Using ${backend.label}`, 32)
-    return applyWindowsNoConsoleSpawnHints(backend)
+    return backend
   }
 
   // backend.kind === 'bootstrap-needed' means resolveHermesBackend couldn't
@@ -3166,7 +3121,7 @@ async function ensureRuntime(backend) {
     )
   }
 
-  backend.command = getNoConsoleVenvPython(VENV_ROOT)
+  backend.command = getVenvPython(VENV_ROOT)
   backend.label = `Hermes at ${ACTIVE_HERMES_ROOT} (venv: ${VENV_ROOT})`
   updateBootProgress({
     phase: 'runtime.ready',
@@ -3175,7 +3130,7 @@ async function ensureRuntime(backend) {
     running: true,
     error: null
   })
-  return applyWindowsNoConsoleSpawnHints(backend)
+  return backend
 }
 
 function fetchJson(url, token, options = {}) {
